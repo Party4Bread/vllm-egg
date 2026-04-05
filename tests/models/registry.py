@@ -555,6 +555,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "XiaomiMiMo/MiMo-V2-Flash", trust_remote_code=True
     ),
     "Dots1ForCausalLM": _HfExamplesInfo("rednote-hilab/dots.llm1.inst"),
+    "EGGForCausalLM": _HfExamplesInfo(
+        "ESHyperscale/nano-egg", enforce_eager=True
+    ),
 }
 
 _EMBEDDING_EXAMPLE_MODELS = {

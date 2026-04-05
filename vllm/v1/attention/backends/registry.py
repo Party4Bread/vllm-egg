@@ -145,6 +145,7 @@ class MambaAttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     SHORT_CONV = "vllm.v1.attention.backends.short_conv_attn.ShortConvAttentionBackend"
     LINEAR = "vllm.v1.attention.backends.linear_attn.LinearAttentionBackend"
     GDN_ATTN = "vllm.v1.attention.backends.gdn_attn.GDNAttentionBackend"
+    EGG_GRU = "vllm.v1.attention.backends.egg_attn.EGGAttentionBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None
@@ -199,6 +200,7 @@ MAMBA_TYPE_TO_BACKEND_MAP = {
     "short_conv": MambaAttentionBackendEnum.SHORT_CONV.name,
     "linear_attention": MambaAttentionBackendEnum.LINEAR.name,
     "gdn_attention": MambaAttentionBackendEnum.GDN_ATTN.name,
+    "egg_gru": MambaAttentionBackendEnum.EGG_GRU.name,
     "custom": MambaAttentionBackendEnum.CUSTOM.name,
 }
 
