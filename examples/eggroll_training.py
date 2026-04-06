@@ -134,13 +134,12 @@ def main():
     )
 
     if args.num_gpus > 1:
-        from vllm.eggroll import MultiGPUEggRollTrainer
+        from vllm.eggroll import DistributedEggRollTrainer
 
-        trainer = MultiGPUEggRollTrainer(
+        trainer = DistributedEggRollTrainer(
             model_name=args.model,
             config=config,
             fitness_fn=simple_reward_fn,
-            num_workers=args.num_gpus,
             prompt_fn=get_prompts,
         )
     else:

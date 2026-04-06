@@ -2,24 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EGGROLL trainer using vLLM for efficient batched generation.
 
-Two generation strategies:
+Generation strategies:
+  LoRA-batched (default): Each member → PEFT LoRA adapter → single vLLM batch.
+  Sequential (fallback):  perturb → generate → restore per member.
 
-1. **LoRA-batched** (default, `use_lora=True`):
-   Each population member's perturbation is exported as a PEFT LoRA adapter.
-   All members' prompts are submitted to vLLM in ONE generate() call with
-   per-request LoRARequest objects. vLLM's continuous-batching scheduler
-   handles all members in parallel — true population-level batching.
-
-2. **Sequential** (`use_lora=False`):
-   Each member's weights are applied in-place, generated, then restored.
-   One vLLM.generate() call per member. Simpler but slower.
-
-Multi-GPU support:
-- `tensor_parallel_size`: splits the model across GPUs (model parallelism).
-  All population members still share the same TP group.
-- `gpu_parallel_popsize`: splits the population across independent vLLM
-  instances on different GPUs. Each instance handles a subset of the
-  population. Requires multiple GPUs not used by TP.
+Multi-node:
+  DistributedEggRollTrainer uses torch.distributed to shard the population
+  across nodes. Each node runs its own vLLM instance, evaluates a pop slice,
+  then all-gathers fitness scores so every node can compute identical
+  gradients deterministically — no gradient transfer required.
 
 Reference: https://github.com/ESHyperscale/HyperscaleES
 """
@@ -47,6 +38,8 @@ from vllm.eggroll.noiser import (
 
 logger = logging.getLogger(__name__)
 
+_NOISER_MAP = {"eggroll": EggRoll, "open_es": OpenES}
+
 
 @dataclass
 class EggRollConfig:
@@ -60,7 +53,7 @@ class EggRollConfig:
     noise_reuse: int = 0
     freeze_nonlora: bool = True
     group_size: int = 0
-    noiser_type: str = "eggroll"  # "eggroll" or "open_es"
+    noiser_type: str = "eggroll"
 
     # Optimizer
     optimizer_cls: str = "Adam"
@@ -73,11 +66,11 @@ class EggRollConfig:
     temperature: float = 0.0
     top_p: float = 1.0
 
-    # LoRA-batched mode (the scalable path)
+    # LoRA-batched mode
     use_lora: bool = True
-    max_loras_per_batch: int = 16  # vLLM max_loras (GPU LoRA slots)
+    max_loras_per_batch: int = 16
 
-    # Training loop
+    # Training
     num_epochs: int = 100
     validate_every: int = 10
     log_every: int = 1
@@ -103,28 +96,9 @@ class EpochStats:
 
 
 class EggRollTrainer:
-    """EGGROLL trainer with LoRA-batched population evaluation.
+    """Single-node EGGROLL trainer.
 
-    Usage::
-
-        from vllm.eggroll import EggRollTrainer
-        from vllm.eggroll.trainer import EggRollConfig
-
-        config = EggRollConfig(
-            sigma=1e-3,
-            lr=1e-4,
-            population_size=64,
-            rank=8,
-            use_lora=True,  # Enable LoRA-batched generation
-        )
-
-
-        def fitness_fn(prompts, generations):
-            return torch.tensor([score(p, g) for p, g in zip(prompts, generations)])
-
-
-        trainer = EggRollTrainer("meta-llama/Llama-3.1-8B", config, fitness_fn)
-        trainer.train(prompts=["Solve x^2=4"])
+    Caches param_plan at init to avoid repeated classify_param() in hot paths.
     """
 
     def __init__(
@@ -147,22 +121,19 @@ class EggRollTrainer:
         self._frozen: FrozenNoiserParams | None = None
         self._noised: NoisedParams | None = None
         self._param_seeds: dict[str, int] | None = None
+        self._param_plan = None  # Cached (name, classification, seed) list
         self._original_params: dict[str, torch.Tensor] | None = None
         self._adapter_tmpdir: str | None = None
 
     def setup(self) -> None:
-        """Initialize vLLM engine and ES components."""
         from vllm import LLM
 
-        logger.info("Initializing vLLM: %s", self.model_name)
-
-        llm_kwargs = {
+        llm_kwargs: dict[str, Any] = {
             "model": self.model_name,
             "tensor_parallel_size": self.config.tensor_parallel_size,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "seed": self.config.seed,
         }
-
         if self.config.use_lora:
             llm_kwargs.update(
                 {
@@ -181,9 +152,7 @@ class EggRollTrainer:
         self._llm = LLM(**llm_kwargs)
         self._model = self._get_model()
 
-        noiser_map = {"eggroll": EggRoll, "open_es": OpenES}
-        self._noiser_cls = noiser_map[self.config.noiser_type]
-
+        self._noiser_cls = _NOISER_MAP[self.config.noiser_type]
         optim_cls = getattr(torch.optim, self.config.optimizer_cls)
         self._frozen, self._noised = self._noiser_cls.init(
             model=self._model,
@@ -199,34 +168,29 @@ class EggRollTrainer:
         self._param_seeds = self._noiser_cls.get_param_seeds(
             self._model, self.config.seed
         )
+        self._param_plan = self._noiser_cls.get_param_plan(
+            self._model, self.config.seed
+        )
         self._snapshot_params()
 
-        # Temp directory for LoRA adapter files
         if self.config.use_lora:
             self._adapter_tmpdir = tempfile.mkdtemp(prefix="eggroll_lora_")
 
-        n_lora = sum(
-            1
-            for n, p in self._model.named_parameters()
-            if self._noiser_cls.classify_param(n, p) == 1  # MM_PARAM
-        )
         logger.info(
-            "EGGROLL ready: pop=%d, sigma=%.1e, lr=%.1e, rank=%d, "
-            "lora_modules=%d, mode=%s",
+            "EGGROLL ready: pop=%d sigma=%.1e rank=%d mode=%s",
             self.config.population_size,
             self.config.sigma,
-            self.config.lr,
             self.config.rank,
-            n_lora,
-            "lora-batched" if self.config.use_lora else "sequential",
+            "lora" if self.config.use_lora else "seq",
         )
 
     def _get_model(self) -> nn.Module:
-        workers = self._llm.llm_engine.model_executor.drivers
-        if hasattr(workers, "__iter__"):
+        executor = self._llm.llm_engine.model_executor
+        workers = getattr(executor, "drivers", None)
+        if workers and hasattr(workers, "__iter__"):
             worker = list(workers)[0]
         else:
-            worker = self._llm.llm_engine.model_executor.driver_worker
+            worker = executor.driver_worker
         return worker.model_runner.model
 
     def _restore_params(self) -> None:
@@ -237,226 +201,191 @@ class EggRollTrainer:
 
     def _snapshot_params(self) -> None:
         self._original_params = {
-            name: param.data.clone() for name, param in self._model.named_parameters()
+            n: p.data.clone() for n, p in self._model.named_parameters()
         }
 
     # ------------------------------------------------------------------
-    # LoRA-batched generation (scalable)
+    # Generation
     # ------------------------------------------------------------------
 
     def _generate_lora_batched(
         self,
         prompts: list[str],
         epoch: int,
+        member_offset: int = 0,
     ) -> list[list[str]]:
-        """Generate text for ALL population members in one vLLM batch.
-
-        Each member's perturbation is a LoRA adapter. All prompts × members
-        are submitted as separate requests with per-request LoRARequest.
-        vLLM's scheduler batches them, serving multiple LoRAs concurrently.
-        """
+        """All members in one vLLM batch via LoRA adapters."""
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
 
-        pop_size = self.config.population_size
-        sampling_params = SamplingParams(
+        pop = self.config.population_size
+        sp = SamplingParams(
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
         )
 
-        # Export all population members as LoRA adapters
-        adapter_dirs = self._noiser_cls.export_lora_adapters(
+        dirs = self._noiser_cls.export_lora_adapters(
             self._frozen,
             self._noised.sigma,
             epoch,
-            pop_size,
+            pop,
             self._model,
             self._param_seeds,
             self._adapter_tmpdir,
+            param_plan=self._param_plan,
         )
 
-        # Build flat list of (prompt, lora_request) for all members
-        all_prompts = []
-        all_lora_requests = []
-        for member_id in range(pop_size):
-            lora_req = LoRARequest(
-                lora_name=f"member_{member_id}",
-                lora_int_id=member_id + 1,  # Must be > 0
-                lora_path=adapter_dirs[member_id],
+        all_prompts: list[str] = []
+        all_lora: list[LoRARequest] = []
+        for mid in range(pop):
+            lr = LoRARequest(
+                lora_name=f"m{member_offset + mid}_e{epoch}",
+                lora_int_id=member_offset + mid + 1,
+                lora_path=dirs[mid],
             )
-            for prompt in prompts:
-                all_prompts.append(prompt)
-                all_lora_requests.append(lora_req)
+            for p in prompts:
+                all_prompts.append(p)
+                all_lora.append(lr)
 
-        # Single batched generate call — vLLM handles scheduling
-        outputs = self._llm.generate(
-            all_prompts,
-            sampling_params,
-            lora_request=all_lora_requests,
-        )
+        outputs = self._llm.generate(all_prompts, sp, lora_request=all_lora)
 
-        # Reshape outputs: [pop_size][num_prompts]
-        n_prompts = len(prompts)
-        all_generations: list[list[str]] = []
-        for member_id in range(pop_size):
-            start = member_id * n_prompts
-            end = start + n_prompts
-            member_gens = [o.outputs[0].text for o in outputs[start:end]]
-            all_generations.append(member_gens)
-
-        return all_generations
-
-    # ------------------------------------------------------------------
-    # Sequential generation (fallback)
-    # ------------------------------------------------------------------
+        n = len(prompts)
+        return [
+            [o.outputs[0].text for o in outputs[i * n : (i + 1) * n]]
+            for i in range(pop)
+        ]
 
     def _generate_sequential(
         self,
         prompts: list[str],
         epoch: int,
+        member_offset: int = 0,
     ) -> list[list[str]]:
-        """Generate text member-by-member with weight perturbation."""
         from vllm import SamplingParams
 
-        sampling_params = SamplingParams(
+        sp = SamplingParams(
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
         )
-
-        pop_size = self.config.population_size
-        all_generations: list[list[str]] = []
-
-        for member_id in range(pop_size):
+        result: list[list[str]] = []
+        for mid in range(self.config.population_size):
             self._noiser_cls.perturb_model(
                 self._frozen,
                 self._noised.sigma,
                 self._model,
                 epoch,
-                member_id,
+                member_offset + mid,
                 self._param_seeds,
                 self._original_params,
             )
-            outputs = self._llm.generate(prompts, sampling_params)
-            all_generations.append([o.outputs[0].text for o in outputs])
+            outs = self._llm.generate(prompts, sp)
+            result.append([o.outputs[0].text for o in outs])
             self._restore_params()
-
-        return all_generations
+        return result
 
     # ------------------------------------------------------------------
-    # Fitness evaluation
+    # Fitness
     # ------------------------------------------------------------------
 
     def _evaluate_fitness(
-        self, prompts: list[str], all_generations: list[list[str]]
+        self, prompts: list[str], all_gens: list[list[str]]
     ) -> torch.Tensor:
-        scores = torch.zeros(len(all_generations))
-        for i, gens in enumerate(all_generations):
+        scores = torch.zeros(len(all_gens))
+        for i, gens in enumerate(all_gens):
             s = self.fitness_fn(prompts, gens)
             scores[i] = s.mean() if isinstance(s, torch.Tensor) else float(s)
         return scores
 
     # ------------------------------------------------------------------
-    # Single epoch
+    # Epoch
     # ------------------------------------------------------------------
 
     def train_epoch(self, prompts: list[str], epoch: int) -> EpochStats:
-        pop_size = self.config.population_size
+        pop = self.config.population_size
 
-        # 1. Generate (LoRA-batched or sequential)
         t0 = time.time()
         if self.config.use_lora:
-            all_generations = self._generate_lora_batched(prompts, epoch)
+            gens = self._generate_lora_batched(prompts, epoch)
         else:
-            all_generations = self._generate_sequential(prompts, epoch)
+            gens = self._generate_sequential(prompts, epoch)
         gen_time = time.time() - t0
 
-        # 2. Evaluate fitness
         t0 = time.time()
-        raw_scores = self._evaluate_fitness(prompts, all_generations)
-        fitness_time = time.time() - t0
+        raw = self._evaluate_fitness(prompts, gens)
+        fit_time = time.time() - t0
 
-        # 3. Normalize + gradient + update (vectorized)
         t0 = time.time()
-        fitnesses = self._noiser_cls.convert_fitnesses(self._frozen, raw_scores)
-        gradients = self._noiser_cls.compute_gradients(
+        fitnesses = self._noiser_cls.convert_fitnesses(self._frozen, raw)
+        grads = self._noiser_cls.compute_gradients(
             self._frozen,
             self._noised.sigma,
             epoch,
-            pop_size,
+            pop,
             self._model,
             self._param_seeds,
             fitnesses,
+            param_plan=self._param_plan,
         )
+        old = {n: p.data.clone() for n, p in self._model.named_parameters()}
+        self._noiser_cls.update_params(self._noised, self._model, grads)
 
-        old_params = {n: p.data.clone() for n, p in self._model.named_parameters()}
-        self._noiser_cls.update_params(self._noised, self._model, gradients)
-
-        total_sq, total_n = 0.0, 0
-        for name, param in self._model.named_parameters():
-            diff = (param.data - old_params[name]).float()
-            total_sq += (diff**2).sum().item()
-            total_n += diff.numel()
-        param_norm = (total_sq / max(total_n, 1)) ** 0.5
-
-        update_time = time.time() - t0
+        sq, n_el = 0.0, 0
+        for name, p in self._model.named_parameters():
+            d = (p.data - old[name]).float()
+            sq += (d**2).sum().item()
+            n_el += d.numel()
+        upd_time = time.time() - t0
         self._snapshot_params()
 
         return EpochStats(
             epoch=epoch,
-            mean_fitness=raw_scores.mean().item(),
-            std_fitness=raw_scores.std().item(),
-            max_fitness=raw_scores.max().item(),
-            min_fitness=raw_scores.min().item(),
+            mean_fitness=raw.mean().item(),
+            std_fitness=raw.std().item(),
+            max_fitness=raw.max().item(),
+            min_fitness=raw.min().item(),
             generation_time=gen_time,
-            fitness_time=fitness_time,
-            update_time=update_time,
-            param_change_norm=param_norm,
+            fitness_time=fit_time,
+            update_time=upd_time,
+            param_change_norm=(sq / max(n_el, 1)) ** 0.5,
         )
-
-    # ------------------------------------------------------------------
-    # Full training loop
-    # ------------------------------------------------------------------
 
     def train(self, prompts: list[str] | None = None) -> list[EpochStats]:
         if self._llm is None:
             self.setup()
 
-        all_stats: list[EpochStats] = []
+        stats: list[EpochStats] = []
         for epoch in range(self.config.num_epochs):
-            if self.prompt_fn is not None:
-                epoch_prompts = self.prompt_fn(epoch, self.config.population_size)
-            elif prompts is not None:
-                epoch_prompts = prompts
-            else:
+            ep = (
+                self.prompt_fn(epoch, self.config.population_size)
+                if self.prompt_fn
+                else prompts
+            )
+            if ep is None:
                 raise ValueError("Provide prompts or prompt_fn")
 
             if self.validation_fn and epoch % self.config.validate_every == 0:
-                val = self.validation_fn(self._llm, epoch)
-                logger.info("Epoch %d validation: %.4f", epoch, val)
-
-            stats = self.train_epoch(epoch_prompts, epoch)
-            all_stats.append(stats)
-
-            if epoch % self.config.log_every == 0:
                 logger.info(
-                    "Epoch %d: fitness=%.4f±%.4f [%.4f,%.4f] "
-                    "gen=%.1fs upd=%.1fs Δw=%.2e",
+                    "Epoch %d val: %.4f",
                     epoch,
-                    stats.mean_fitness,
-                    stats.std_fitness,
-                    stats.min_fitness,
-                    stats.max_fitness,
-                    stats.generation_time,
-                    stats.update_time,
-                    stats.param_change_norm,
+                    self.validation_fn(self._llm, epoch),
                 )
 
-        return all_stats
+            s = self.train_epoch(ep, epoch)
+            stats.append(s)
+            if epoch % self.config.log_every == 0:
+                logger.info(
+                    "Epoch %d: fit=%.4f±%.4f gen=%.1fs upd=%.1fs",
+                    epoch,
+                    s.mean_fitness,
+                    s.std_fitness,
+                    s.generation_time,
+                    s.update_time,
+                )
+        return stats
 
     def cleanup(self) -> None:
-        """Remove temporary LoRA adapter files."""
         if self._adapter_tmpdir and os.path.exists(self._adapter_tmpdir):
             shutil.rmtree(self._adapter_tmpdir)
             self._adapter_tmpdir = None
@@ -464,12 +393,9 @@ class EggRollTrainer:
     def save_checkpoint(self, path: str) -> None:
         torch.save(
             {
-                "model_state_dict": {
-                    n: p.data.clone() for n, p in self._model.named_parameters()
-                },
-                "optimizer_state_dict": self._noised.optimizer.state_dict(),
+                "model": {n: p.data.cpu() for n, p in self._model.named_parameters()},
+                "optim": self._noised.optimizer.state_dict(),
                 "step": self._noised.step,
-                "config": self.config,
             },
             path,
         )
@@ -477,10 +403,10 @@ class EggRollTrainer:
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, weights_only=False)
         with torch.no_grad():
-            for name, param in self._model.named_parameters():
-                if name in ckpt["model_state_dict"]:
-                    param.copy_(ckpt["model_state_dict"][name])
-        self._noised.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            for n, p in self._model.named_parameters():
+                if n in ckpt["model"]:
+                    p.copy_(ckpt["model"][n])
+        self._noised.optimizer.load_state_dict(ckpt["optim"])
         self._noised.step = ckpt["step"]
         self._snapshot_params()
 
@@ -488,24 +414,36 @@ class EggRollTrainer:
         self.cleanup()
 
 
-class MultiGPUEggRollTrainer:
-    """Multi-GPU EGGROLL trainer that shards population across GPU workers.
+# ======================================================================
+# Multi-node distributed trainer
+# ======================================================================
 
-    Splits the population across `num_workers` independent vLLM instances,
-    each running on separate GPUs. Each worker evaluates a subset of the
-    population, then gradients are aggregated.
 
-    This is orthogonal to tensor parallelism (which splits the model).
+class DistributedEggRollTrainer:
+    """Multi-node EGGROLL trainer using torch.distributed.
 
-    Usage::
+    Key insight: ES gradients are deterministic given the fitness scores.
+    So we only need to all-gather the fitness vector (pop_size floats),
+    not the gradients (millions of floats). Each node computes identical
+    gradients locally from the shared fitness vector.
 
-        trainer = MultiGPUEggRollTrainer(
-            model_name="meta-llama/Llama-3.1-8B",
-            config=EggRollConfig(population_size=256, rank=8),
-            fitness_fn=my_fitness_fn,
-            num_workers=4,  # 4 GPUs, 64 members each
-        )
-        trainer.train(prompts=["Solve x^2=4"])
+    Architecture::
+
+        Node 0: vLLM instance → evaluates members [0, pop/N)
+        Node 1: vLLM instance → evaluates members [pop/N, 2*pop/N)
+        ...
+        Node N-1: → evaluates members [(N-1)*pop/N, pop)
+
+        All-gather fitness scores (tiny: pop_size floats)
+        Each node computes same gradients locally → same update
+
+    Launch with torchrun::
+
+        torchrun --nproc_per_node=1 --nnodes=4 \\
+            --rdzv_backend=c10d --rdzv_endpoint=head:29500 \\
+            my_script.py
+
+    Or with SLURM + srun.
     """
 
     def __init__(
@@ -513,179 +451,175 @@ class MultiGPUEggRollTrainer:
         model_name: str,
         config: EggRollConfig,
         fitness_fn: Callable[[list[str], list[str]], torch.Tensor],
-        num_workers: int = 1,
         prompt_fn: Callable[[int, int], list[str]] | None = None,
         validation_fn: Callable[[Any, int], float] | None = None,
-        gpu_ids: list[int] | None = None,
+        backend: str = "nccl",
     ):
         self.model_name = model_name
         self.config = config
         self.fitness_fn = fitness_fn
-        self.num_workers = num_workers
         self.prompt_fn = prompt_fn
         self.validation_fn = validation_fn
-        self.gpu_ids = gpu_ids or list(range(num_workers))
+        self.backend = backend
 
-        assert config.population_size % num_workers == 0, (
-            f"population_size ({config.population_size}) must be divisible "
-            f"by num_workers ({num_workers})"
-        )
-        self._pop_per_worker = config.population_size // num_workers
-
-        # These are shared across workers
-        self._noiser_cls = None
-        self._frozen: FrozenNoiserParams | None = None
-        self._noised: NoisedParams | None = None
-        self._model: nn.Module | None = None
-        self._param_seeds: dict[str, int] | None = None
-        self._original_params: dict[str, torch.Tensor] | None = None
-        self._workers: list[Any] = []
+        self._trainer: EggRollTrainer | None = None
+        self._rank = 0
+        self._world_size = 1
+        self._local_pop = 0
+        self._member_offset = 0
 
     def setup(self) -> None:
-        """Initialize workers and ES state."""
-        noiser_map = {"eggroll": EggRoll, "open_es": OpenES}
-        self._noiser_cls = noiser_map[self.config.noiser_type]
+        """Initialize distributed process group and local vLLM trainer."""
+        import torch.distributed as dist
 
-        # Initialize first worker to get model reference
-        logger.info(
-            "Initializing %d GPU workers for population of %d",
-            self.num_workers,
-            self.config.population_size,
+        if not dist.is_initialized():
+            dist.init_process_group(backend=self.backend)
+
+        self._rank = dist.get_rank()
+        self._world_size = dist.get_world_size()
+
+        pop = self.config.population_size
+        assert pop % self._world_size == 0, (
+            f"pop_size ({pop}) must be divisible by world_size ({self._world_size})"
         )
+        self._local_pop = pop // self._world_size
+        self._member_offset = self._rank * self._local_pop
 
-        for worker_idx in range(self.num_workers):
-            gpu_id = self.gpu_ids[worker_idx]
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        # Each node creates its own vLLM instance with a pop slice
+        local_config = EggRollConfig(**{k: v for k, v in self.config.__dict__.items()})
+        local_config.population_size = self._local_pop
 
-            worker_config = EggRollConfig(
-                **{
-                    k: v
-                    for k, v in self.config.__dict__.items()
-                    if k != "population_size"
-                }
-            )
-            worker_config.population_size = self._pop_per_worker
-
-            worker = EggRollTrainer(
-                model_name=self.model_name,
-                config=worker_config,
-                fitness_fn=self.fitness_fn,
-                prompt_fn=self.prompt_fn,
-            )
-            worker.setup()
-            self._workers.append(worker)
-
-            if worker_idx == 0:
-                self._model = worker._model
-                self._param_seeds = worker._param_seeds
-                self._original_params = worker._original_params
-                self._frozen = worker._frozen
-                self._noised = worker._noised
+        self._trainer = EggRollTrainer(
+            model_name=self.model_name,
+            config=local_config,
+            fitness_fn=self.fitness_fn,
+            prompt_fn=self.prompt_fn,
+            validation_fn=self.validation_fn,
+        )
+        self._trainer.setup()
 
         logger.info(
-            "Multi-GPU ready: %d workers × %d members = %d total",
-            self.num_workers,
-            self._pop_per_worker,
-            self.config.population_size,
+            "Distributed rank %d/%d: members [%d, %d)",
+            self._rank,
+            self._world_size,
+            self._member_offset,
+            self._member_offset + self._local_pop,
         )
 
     def train_epoch(self, prompts: list[str], epoch: int) -> EpochStats:
-        """Run one epoch across all GPU workers."""
-        pop_size = self.config.population_size
+        """Run one epoch with distributed fitness gathering."""
+        import torch.distributed as dist
 
+        pop = self.config.population_size
+        local_pop = self._local_pop
+        trainer = self._trainer
+
+        # 1. Generate locally for our population slice
         t0 = time.time()
-        all_generations: list[list[str]] = []
-        for worker in self._workers:
-            if self.config.use_lora:
-                gens = worker._generate_lora_batched(prompts, epoch)
-            else:
-                gens = worker._generate_sequential(prompts, epoch)
-            all_generations.extend(gens)
+        if self.config.use_lora:
+            local_gens = trainer._generate_lora_batched(
+                prompts, epoch, member_offset=self._member_offset
+            )
+        else:
+            local_gens = trainer._generate_sequential(
+                prompts, epoch, member_offset=self._member_offset
+            )
         gen_time = time.time() - t0
 
-        # Evaluate fitness
+        # 2. Evaluate local fitness
         t0 = time.time()
-        raw_scores = torch.zeros(pop_size)
-        for i, gens in enumerate(all_generations):
-            s = self.fitness_fn(prompts, gens)
-            raw_scores[i] = s.mean() if isinstance(s, torch.Tensor) else float(s)
-        fitness_time = time.time() - t0
+        local_scores = trainer._evaluate_fitness(prompts, local_gens)
+        fit_time = time.time() - t0
 
-        # Gradient + update (centralized on first worker's model)
+        # 3. All-gather fitness scores across all nodes
+        # This is the ONLY communication: pop_size floats (~256 bytes for pop=64)
         t0 = time.time()
-        fitnesses = self._noiser_cls.convert_fitnesses(self._frozen, raw_scores)
-        gradients = self._noiser_cls.compute_gradients(
-            self._frozen,
-            self._noised.sigma,
+        device = next(trainer._model.parameters()).device
+        local_scores_gpu = local_scores.to(device)
+        gathered = [
+            torch.zeros(local_pop, device=device) for _ in range(self._world_size)
+        ]
+        dist.all_gather(gathered, local_scores_gpu)
+        all_scores = torch.cat(gathered).cpu()
+
+        # 4. Each node computes identical gradients from full fitness
+        fitnesses = trainer._noiser_cls.convert_fitnesses(trainer._frozen, all_scores)
+        grads = trainer._noiser_cls.compute_gradients(
+            trainer._frozen,
+            trainer._noised.sigma,
             epoch,
-            pop_size,
-            self._model,
-            self._param_seeds,
+            pop,
+            trainer._model,
+            trainer._param_seeds,
             fitnesses,
+            param_plan=trainer._param_plan,
         )
 
-        old_params = {n: p.data.clone() for n, p in self._model.named_parameters()}
-        self._noiser_cls.update_params(self._noised, self._model, gradients)
+        old = {n: p.data.clone() for n, p in trainer._model.named_parameters()}
+        trainer._noiser_cls.update_params(trainer._noised, trainer._model, grads)
 
-        # Sync updated params to all workers
-        for worker in self._workers[1:]:
-            with torch.no_grad():
-                for name, param in self._model.named_parameters():
-                    w_param = dict(worker._model.named_parameters())[name]
-                    w_param.copy_(param.data)
-            worker._snapshot_params()
+        sq, n_el = 0.0, 0
+        for name, p in trainer._model.named_parameters():
+            d = (p.data - old[name]).float()
+            sq += (d**2).sum().item()
+            n_el += d.numel()
 
-        total_sq, total_n = 0.0, 0
-        for name, param in self._model.named_parameters():
-            diff = (param.data - old_params[name]).float()
-            total_sq += (diff**2).sum().item()
-            total_n += diff.numel()
-        param_norm = (total_sq / max(total_n, 1)) ** 0.5
-
-        update_time = time.time() - t0
-        self._workers[0]._snapshot_params()
+        upd_time = time.time() - t0
+        trainer._snapshot_params()
 
         return EpochStats(
             epoch=epoch,
-            mean_fitness=raw_scores.mean().item(),
-            std_fitness=raw_scores.std().item(),
-            max_fitness=raw_scores.max().item(),
-            min_fitness=raw_scores.min().item(),
+            mean_fitness=all_scores.mean().item(),
+            std_fitness=all_scores.std().item(),
+            max_fitness=all_scores.max().item(),
+            min_fitness=all_scores.min().item(),
             generation_time=gen_time,
-            fitness_time=fitness_time,
-            update_time=update_time,
-            param_change_norm=param_norm,
+            fitness_time=fit_time,
+            update_time=upd_time,
+            param_change_norm=(sq / max(n_el, 1)) ** 0.5,
         )
 
     def train(self, prompts: list[str] | None = None) -> list[EpochStats]:
-        if not self._workers:
+        if self._trainer is None:
             self.setup()
 
-        all_stats: list[EpochStats] = []
+        stats: list[EpochStats] = []
         for epoch in range(self.config.num_epochs):
-            if self.prompt_fn is not None:
-                epoch_prompts = self.prompt_fn(epoch, self.config.population_size)
-            elif prompts is not None:
-                epoch_prompts = prompts
-            else:
+            ep = (
+                self.prompt_fn(epoch, self.config.population_size)
+                if self.prompt_fn
+                else prompts
+            )
+            if ep is None:
                 raise ValueError("Provide prompts or prompt_fn")
 
-            stats = self.train_epoch(epoch_prompts, epoch)
-            all_stats.append(stats)
-
-            if epoch % self.config.log_every == 0:
+            if (
+                self.validation_fn
+                and epoch % self.config.validate_every == 0
+                and self._rank == 0
+            ):
                 logger.info(
-                    "Epoch %d [%d GPUs]: fitness=%.4f±%.4f gen=%.1fs upd=%.1fs",
+                    "Epoch %d val: %.4f",
                     epoch,
-                    self.num_workers,
-                    stats.mean_fitness,
-                    stats.std_fitness,
-                    stats.generation_time,
-                    stats.update_time,
+                    self.validation_fn(self._trainer._llm, epoch),
                 )
 
-        return all_stats
+            s = self.train_epoch(ep, epoch)
+            stats.append(s)
+
+            if epoch % self.config.log_every == 0 and self._rank == 0:
+                logger.info(
+                    "Epoch %d [%d nodes]: fit=%.4f±%.4f gen=%.1fs upd=%.1fs",
+                    epoch,
+                    self._world_size,
+                    s.mean_fitness,
+                    s.std_fitness,
+                    s.generation_time,
+                    s.update_time,
+                )
+
+        return stats
 
     def cleanup(self) -> None:
-        for worker in self._workers:
-            worker.cleanup()
+        if self._trainer:
+            self._trainer.cleanup()
