@@ -9,6 +9,6 @@ Reference: https://github.com/ESHyperscale/HyperscaleES
 """
 
 from vllm.eggroll.noiser import EggRoll, OpenES
-from vllm.eggroll.trainer import EggRollTrainer
+from vllm.eggroll.trainer import EggRollTrainer, MultiGPUEggRollTrainer
 
-__all__ = ["EggRoll", "OpenES", "EggRollTrainer"]
+__all__ = ["EggRoll", "OpenES", "EggRollTrainer", "MultiGPUEggRollTrainer"]

@@ -404,6 +404,117 @@ class EggRoll:
     ) -> torch.Tensor:
         return normalize_fitnesses(raw_scores, frozen.group_size)
 
+    @classmethod
+    def export_lora_adapters(
+        cls,
+        frozen: FrozenNoiserParams,
+        sigma: float,
+        epoch: int,
+        pop_size: int,
+        model: nn.Module,
+        param_seeds: dict[str, int],
+        output_dir: str,
+        target_modules: list[str] | None = None,
+    ) -> list[str]:
+        """Export each population member's perturbation as a PEFT LoRA adapter.
+
+        This allows vLLM to serve all population members in a single batch
+        by loading each member as a separate LoRA adapter.
+
+        Args:
+            frozen: Frozen noiser config.
+            sigma: Perturbation magnitude.
+            epoch: Current epoch.
+            pop_size: Population size.
+            model: The base model.
+            param_seeds: Per-parameter seeds.
+            output_dir: Base directory for adapter files.
+            target_modules: List of module name suffixes to include.
+                If None, auto-detected from model.
+
+        Returns:
+            List of adapter directory paths (one per pop member).
+        """
+        import json
+        import os
+
+        from safetensors.torch import save_file
+
+        r = frozen.rank
+        adapter_dirs = []
+
+        # Detect target modules from the model
+        if target_modules is None:
+            target_modules = []
+            for name, param in model.named_parameters():
+                if cls.classify_param(name, param) == MM_PARAM:
+                    # Extract the module suffix (e.g. "q_proj", "k_proj")
+                    parts = name.split(".")
+                    # Remove ".weight" suffix
+                    if parts[-1] == "weight":
+                        parts = parts[:-1]
+                    target_modules.append(parts[-1])
+            target_modules = sorted(set(target_modules))
+
+        for member_id in range(pop_size):
+            adapter_dir = os.path.join(output_dir, f"member_{member_id}")
+            os.makedirs(adapter_dir, exist_ok=True)
+
+            # Build LoRA tensors for this member
+            tensors = {}
+            true_epoch = 0 if frozen.noise_reuse == 0 else epoch // frozen.noise_reuse
+            true_thread = member_id // 2
+            sign = 1.0 if member_id % 2 == 0 else -1.0
+
+            for name, param in model.named_parameters():
+                classification = cls.classify_param(name, param)
+                if classification != MM_PARAM:
+                    continue
+
+                seed = param_seeds[name]
+                a, b = param.shape
+                gen = torch.Generator()
+                combined = seed ^ (true_epoch * 2654435761) ^ (true_thread * 40503)
+                gen.manual_seed(combined & 0xFFFFFFFF)
+
+                lora = torch.randn(
+                    a + b, r, generator=gen, dtype=param.dtype, device="cpu"
+                )
+                B_i = lora[:b]  # (in_dim, rank) -> lora_A
+                A_i = lora[b:]  # (out_dim, rank) -> lora_B
+
+                eff_sigma = sign * sigma / math.sqrt(r)
+
+                # Strip "weight" suffix for module path
+                module_name = name
+                if module_name.endswith(".weight"):
+                    module_name = module_name[: -len(".weight")]
+
+                # PEFT naming: base_model.model.<module>.lora_A.weight
+                peft_prefix = f"base_model.model.{module_name}"
+                # lora_A is (rank, in_dim), lora_B is (out_dim, rank)
+                tensors[f"{peft_prefix}.lora_A.weight"] = B_i.T.contiguous()
+                tensors[f"{peft_prefix}.lora_B.weight"] = (A_i * eff_sigma).contiguous()
+
+            # Save adapter weights
+            save_file(tensors, os.path.join(adapter_dir, "adapter_model.safetensors"))
+
+            # Save adapter config
+            config = {
+                "r": r,
+                "lora_alpha": r,  # alpha=r means scaling=1.0
+                "target_modules": target_modules,
+                "bias": "none",
+                "task_type": "CAUSAL_LM",
+                "peft_type": "LORA",
+            }
+            with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+                json.dump(config, f)
+
+            adapter_dirs.append(adapter_dir)
+
+        return adapter_dirs
+
 
 class OpenES:
     """OpenAI-style ES. Full-rank perturbations for all parameters."""

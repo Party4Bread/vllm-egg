@@ -97,6 +97,18 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--use-lora",
+        action="store_true",
+        default=True,
+        help="Use LoRA-batched generation (recommended)",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for multi-GPU population sharding",
+    )
+    parser.add_argument(
         "--checkpoint-path",
         type=str,
         default=None,
@@ -116,16 +128,28 @@ def main():
         temperature=args.temperature,
         num_epochs=args.num_epochs,
         seed=args.seed,
+        use_lora=args.use_lora,
         optimizer_cls="Adam",
         optimizer_kwargs={"betas": (0.9, 0.999)},
     )
 
-    trainer = EggRollTrainer(
-        model_name=args.model,
-        config=config,
-        fitness_fn=simple_reward_fn,
-        prompt_fn=get_prompts,
-    )
+    if args.num_gpus > 1:
+        from vllm.eggroll import MultiGPUEggRollTrainer
+
+        trainer = MultiGPUEggRollTrainer(
+            model_name=args.model,
+            config=config,
+            fitness_fn=simple_reward_fn,
+            num_workers=args.num_gpus,
+            prompt_fn=get_prompts,
+        )
+    else:
+        trainer = EggRollTrainer(
+            model_name=args.model,
+            config=config,
+            fitness_fn=simple_reward_fn,
+            prompt_fn=get_prompts,
+        )
 
     logger.info("Starting EGGROLL training with config:")
     logger.info("  Model: %s", args.model)
@@ -134,6 +158,8 @@ def main():
     logger.info("  LR: %e", config.lr)
     logger.info("  Rank: %d", config.rank)
     logger.info("  Noiser: %s", config.noiser_type)
+    logger.info("  Mode: %s", "lora-batched" if args.use_lora else "sequential")
+    logger.info("  GPUs: %d", args.num_gpus)
 
     stats = trainer.train()
 
