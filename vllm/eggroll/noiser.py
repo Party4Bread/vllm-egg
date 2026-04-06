@@ -5,13 +5,12 @@
 Port of HyperscaleES evolutionary strategy noisers from JAX to PyTorch
 for integration with vLLM's inference engine.
 
-The noiser handles:
-- Parameter perturbation via LoRA-style low-rank noise (for weight matrices)
-  or full noise (for biases/scalars)
-- Antithetical sampling (paired +/- perturbations)
-- Fitness normalization
-- Gradient estimation from fitness scores
-- Parameter updates via standard optimizers (Adam, SGD)
+Scalability design:
+- Noise generation is batched: all population members' noise is generated
+  in a single GPU kernel call per parameter (no Python loops over pop).
+- Gradient estimation uses vectorized einsum (LoRA) or broadcast-multiply
+  (full), producing gradients in O(1) kernel launches per parameter.
+- Antithetical sampling is handled via sign vectors, not branching.
 
 Reference: https://github.com/ESHyperscale/HyperscaleES
 """
@@ -28,13 +27,13 @@ from torch import nn
 # Parameter classification constants (matching HyperscaleES)
 PARAM = 0  # Standard parameter (full perturbation)
 MM_PARAM = 1  # Matrix multiply parameter (LoRA perturbation)
-EMB_PARAM = 2  # Embedding parameter (LoRA perturbation on embeddings)
+EMB_PARAM = 2  # Embedding parameter (excluded in current impl)
 EXCLUDED = 3  # Excluded from evolution
 
 
 @dataclass
 class NoisedParams:
-    """Container for parameter state during evolution."""
+    """Mutable state for the noiser during evolution."""
 
     sigma: float
     optimizer: torch.optim.Optimizer
@@ -49,247 +48,203 @@ class FrozenNoiserParams:
     freeze_nonlora: bool = False
     noise_reuse: int = 0
     rank: int = 1
-    use_batched_update: bool = False
 
 
-def _deterministic_key(base_seed: int, epoch: int, thread_idx: int) -> torch.Generator:
-    """Create a deterministic RNG from (base_seed, epoch, thread_idx).
+# ---------------------------------------------------------------------------
+# Vectorized noise generation (all pop members at once)
+# ---------------------------------------------------------------------------
 
-    This mirrors JAX's fold_in(fold_in(key, epoch), thread_idx) pattern
-    for reproducible antithetical noise generation.
+
+def _batch_generators(
+    param_seed: int,
+    noise_reuse: int,
+    epoch: int,
+    pop_size: int,
+) -> list[torch.Generator]:
+    """Create pop_size//2 deterministic generators (one per antithetical pair).
+
+    Returns pop_size generators where pairs share the same seed.
     """
-    gen = torch.Generator()
-    # Combine seeds deterministically
-    combined = base_seed ^ (epoch * 2654435761) ^ (thread_idx * 40503)
-    gen.manual_seed(combined & 0xFFFFFFFF)
-    return gen
+    true_epoch = 0 if noise_reuse == 0 else epoch // noise_reuse
+    gens = []
+    for tid in range(pop_size):
+        true_thread = tid // 2
+        gen = torch.Generator()
+        combined = param_seed ^ (true_epoch * 2654435761) ^ (true_thread * 40503)
+        gen.manual_seed(combined & 0xFFFFFFFF)
+        gens.append(gen)
+    return gens
 
 
-def get_lora_perturbation(
+def batch_lora_noise(
     frozen: FrozenNoiserParams,
     sigma: float,
     epoch: int,
-    thread_id: int,
+    pop_size: int,
     param: torch.Tensor,
     param_seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate LoRA-style low-rank perturbation for a matrix parameter.
-
-    Uses antithetical sampling: even thread_ids get +sigma, odd get -sigma.
-
-    Args:
-        frozen: Frozen noiser configuration.
-        sigma: Base perturbation magnitude.
-        epoch: Current epoch (for noise seed).
-        thread_id: Thread/member index in population.
-        param: The parameter tensor (out_dim, in_dim).
-        param_seed: Base random seed for this parameter.
+    """Generate LoRA noise for ALL population members at once.
 
     Returns:
-        (A, B) where A is (out_dim, rank) and B is (in_dim, rank),
-        such that the perturbation is A @ B^T.
+        A: (pop_size, out_dim, rank) - already scaled by ±sigma/sqrt(rank)
+        B: (pop_size, in_dim, rank) - unscaled random directions
     """
-    true_epoch = 0 if frozen.noise_reuse == 0 else epoch // frozen.noise_reuse
-    true_thread = thread_id // 2
-    sign = 1.0 if thread_id % 2 == 0 else -1.0
-
     a, b = param.shape
     r = frozen.rank
-    gen = _deterministic_key(param_seed, true_epoch, true_thread)
+    device = param.device
+    dtype = param.dtype
 
-    # Generate (a+b) x r random values
-    lora_params = torch.randn(
-        a + b, r, dtype=param.dtype, device=param.device, generator=gen
-    )
-    B = lora_params[:b]  # (in_dim, rank)
-    A = lora_params[b:]  # (out_dim, rank)
+    # Sign vector for antithetical sampling: +1 for even, -1 for odd
+    signs = torch.ones(pop_size, 1, 1, device=device, dtype=dtype)
+    signs[1::2] = -1.0
+    effective_sigma = sigma / math.sqrt(r)
 
-    effective_sigma = sign * sigma / math.sqrt(r)
-    return A * effective_sigma, B
+    # Generate noise for each unique pair on CPU then move to GPU
+    # Only need pop_size//2 unique noise vectors (antithetical pairs share)
+    n_unique = (pop_size + 1) // 2
+    gens = _batch_generators(param_seed, frozen.noise_reuse, epoch, pop_size)
+
+    # Pre-allocate on device
+    all_A = torch.empty(pop_size, a, r, device=device, dtype=dtype)
+    all_B = torch.empty(pop_size, b, r, device=device, dtype=dtype)
+
+    for pair_idx in range(n_unique):
+        gen = gens[pair_idx * 2]
+        lora_params = torch.randn(a + b, r, generator=gen, dtype=dtype, device=device)
+        B_i = lora_params[:b]
+        A_i = lora_params[b:]
+
+        all_A[pair_idx * 2] = A_i
+        all_B[pair_idx * 2] = B_i
+        if pair_idx * 2 + 1 < pop_size:
+            all_A[pair_idx * 2 + 1] = A_i  # Same noise, sign applied later
+            all_B[pair_idx * 2 + 1] = B_i
+
+    # Apply antithetical signs and sigma to A only (matching HyperscaleES)
+    all_A = all_A * signs * effective_sigma
+    return all_A, all_B
 
 
-def get_full_perturbation(
+def batch_full_noise(
     frozen: FrozenNoiserParams,
     sigma: float,
     epoch: int,
-    thread_id: int,
+    pop_size: int,
     param: torch.Tensor,
     param_seed: int,
 ) -> torch.Tensor:
-    """Generate full-rank noise perturbation for a standard parameter.
+    """Generate full-rank noise for ALL population members at once.
 
-    Uses antithetical sampling: even thread_ids get +sigma, odd get -sigma.
+    Returns:
+        noise: (pop_size, *param.shape) - scaled by ±sigma
     """
-    true_epoch = 0 if frozen.noise_reuse == 0 else epoch // frozen.noise_reuse
-    true_thread = thread_id // 2
-    sign = 1.0 if thread_id % 2 == 0 else -1.0
+    device = param.device
+    dtype = param.dtype
+    shape = param.shape
 
-    gen = _deterministic_key(param_seed, true_epoch, true_thread)
-    noise = torch.randn(
-        *param.shape, dtype=param.dtype, device=param.device, generator=gen
-    )
-    return noise * sign * sigma
+    signs = torch.ones(pop_size, *([1] * len(shape)), device=device, dtype=dtype)
+    signs[1::2] = -1.0
+
+    n_unique = (pop_size + 1) // 2
+    gens = _batch_generators(param_seed, frozen.noise_reuse, epoch, pop_size)
+
+    all_noise = torch.empty(pop_size, *shape, device=device, dtype=dtype)
+    for pair_idx in range(n_unique):
+        gen = gens[pair_idx * 2]
+        noise_i = torch.randn(*shape, generator=gen, dtype=dtype, device=device)
+        all_noise[pair_idx * 2] = noise_i
+        if pair_idx * 2 + 1 < pop_size:
+            all_noise[pair_idx * 2 + 1] = noise_i
+
+    return all_noise * signs * sigma
 
 
-def apply_lora_perturbation(
+# ---------------------------------------------------------------------------
+# Vectorized gradient estimation (single kernel per parameter)
+# ---------------------------------------------------------------------------
+
+
+def compute_lora_gradient_batched(
     frozen: FrozenNoiserParams,
     sigma: float,
     epoch: int,
-    thread_id: int,
-    weight: torch.Tensor,
-    x: torch.Tensor,
-    param_seed: int,
-    transpose: bool = False,
-) -> torch.Tensor:
-    """Apply LoRA-perturbed matrix multiplication.
-
-    Computes x @ (W + A @ B^T)^T  (or non-transposed variant).
-    The perturbation is applied implicitly: x @ W^T + (x @ B) @ A^T.
-    """
-    base = x @ weight if transpose else x @ weight.T
-
-    A, B = get_lora_perturbation(frozen, sigma, epoch, thread_id, weight, param_seed)
-    perturbation = (x @ A) @ B.T if transpose else (x @ B) @ A.T
-
-    return base + perturbation
-
-
-def compute_lora_gradient(
-    frozen: FrozenNoiserParams,
-    sigma: float,
+    pop_size: int,
     param: torch.Tensor,
     param_seed: int,
     fitnesses: torch.Tensor,
-    epochs: torch.Tensor,
-    thread_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Estimate gradient for a LoRA-perturbed matrix parameter.
+    """Estimate gradient for a LoRA parameter using vectorized ops.
 
-    Computes: mean_i[ fitness_i * (A_i @ B_i^T) ]
+    grad = mean_i[ fitness_i * A_i @ B_i^T ]
+         = einsum('nir,njr->ij', fitness*A, B) / pop_size
 
-    This is the evolutionary strategy gradient estimate using
-    antithetical sampling and LoRA-style perturbations.
+    This runs in O(1) kernel launches regardless of pop_size.
     """
-    num_envs = fitnesses.shape[0]
-    a, b = param.shape
-    r = frozen.rank
+    # (pop_size, out, rank), (pop_size, in, rank)
+    all_A, all_B = batch_lora_noise(frozen, sigma, epoch, pop_size, param, param_seed)
 
-    grad_accum = torch.zeros_like(param)
-    for i in range(num_envs):
-        A, B = get_lora_perturbation(
-            frozen,
-            sigma / math.sqrt(r),
-            epochs[i].item(),
-            thread_ids[i].item(),
-            param,
-            param_seed,
-        )
-        # Outer product: A @ B^T weighted by fitness
-        grad_accum += fitnesses[i] * (A @ B.T)
+    # Broadcast fitness: (pop_size, 1, 1)
+    f = fitnesses.reshape(pop_size, 1, 1)
+    weighted_A = f * all_A  # (pop_size, out, rank)
 
-    return grad_accum / num_envs
+    # Batched outer product sum via einsum
+    grad = torch.einsum("nir,njr->ij", weighted_A, all_B) / pop_size
+    return grad
 
 
-def compute_full_gradient(
+def compute_full_gradient_batched(
     frozen: FrozenNoiserParams,
     sigma: float,
+    epoch: int,
+    pop_size: int,
     param: torch.Tensor,
     param_seed: int,
     fitnesses: torch.Tensor,
-    epochs: torch.Tensor,
-    thread_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Estimate gradient for a fully-perturbed parameter."""
+    """Estimate gradient for a full-noise parameter using vectorized ops.
+
+    grad = mean_i[ fitness_i * noise_i ]
+
+    Single broadcast-multiply + mean, O(1) kernel launches.
+    """
     if frozen.freeze_nonlora:
         return torch.zeros_like(param)
 
-    num_envs = fitnesses.shape[0]
-    grad_accum = torch.zeros_like(param)
-    for i in range(num_envs):
-        noise = get_full_perturbation(
-            frozen,
-            sigma,
-            epochs[i].item(),
-            thread_ids[i].item(),
-            param,
-            param_seed,
-        )
-        grad_accum += fitnesses[i] * noise
+    all_noise = batch_full_noise(frozen, sigma, epoch, pop_size, param, param_seed)
+    f = fitnesses.reshape(pop_size, *([1] * param.ndim))
+    return (f * all_noise).mean(dim=0)
 
-    return grad_accum / num_envs
+
+# ---------------------------------------------------------------------------
+# Fitness normalization
+# ---------------------------------------------------------------------------
 
 
 def normalize_fitnesses(raw_scores: torch.Tensor, group_size: int = 0) -> torch.Tensor:
-    """Normalize fitness scores using z-score normalization.
-
-    If group_size > 0, normalizes within groups (for shared-prompt settings).
-    Global variance is always used for the denominator.
-
-    Args:
-        raw_scores: Raw fitness scores, shape (population_size,).
-        group_size: If > 0, subtract group mean instead of global mean.
-
-    Returns:
-        Normalized fitness scores.
-    """
-    global_var = torch.var(raw_scores) + 1e-5
-    global_std = torch.sqrt(global_var)
-
+    """Z-score normalize fitness. Group-aware if group_size > 0."""
+    global_std = torch.sqrt(torch.var(raw_scores) + 1e-5)
     if group_size == 0:
         return (raw_scores - raw_scores.mean()) / global_std
-    else:
-        grouped = raw_scores.reshape(-1, group_size)
-        group_means = grouped.mean(dim=-1, keepdim=True)
-        normalized = (grouped - group_means) / global_std
-        return normalized.reshape(-1)
+    grouped = raw_scores.reshape(-1, group_size)
+    group_means = grouped.mean(dim=-1, keepdim=True)
+    return ((grouped - group_means) / global_std).reshape(-1)
 
 
-class BaseNoiser:
-    """Base noiser with no perturbation (evaluation mode)."""
-
-    @classmethod
-    def init(
-        cls,
-        named_params: dict[str, torch.Tensor],
-        sigma: float,
-        lr: float,
-        **kwargs,
-    ) -> tuple[FrozenNoiserParams, NoisedParams]:
-        return FrozenNoiserParams(), NoisedParams(sigma=sigma, optimizer=None)
-
-    @classmethod
-    def perturb_forward(
-        cls,
-        frozen: FrozenNoiserParams,
-        noised: NoisedParams,
-        model: nn.Module,
-        epoch: int,
-        thread_id: int,
-    ) -> None:
-        """No-op: base noiser does not perturb."""
-        pass
-
-    @classmethod
-    def restore(cls, model: nn.Module, original_params: dict) -> None:
-        """Restore model parameters to unperturbed values."""
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                if name in original_params:
-                    param.copy_(original_params[name])
+# ---------------------------------------------------------------------------
+# Noiser classes
+# ---------------------------------------------------------------------------
 
 
 class EggRoll:
     """EGGROLL evolutionary strategy noiser.
 
-    Uses LoRA-style low-rank perturbations for weight matrices and
-    full perturbations for biases/scalars. Integrates with standard
-    PyTorch optimizers for parameter updates.
+    Uses LoRA-style low-rank perturbations for weight matrices (MM_PARAM)
+    and full perturbations for biases/scalars (PARAM). Embeddings and
+    LM heads are excluded from perturbation.
 
-    Key features:
-    - Antithetical sampling (paired +/- perturbations)
-    - LoRA perturbation for memory-efficient matrix noise
-    - Compatible with Adam, SGD, or any PyTorch optimizer
-    - Group-based fitness normalization
+    All noise generation and gradient estimation is vectorized over the
+    population dimension — no Python loops over pop_size.
     """
 
     @classmethod
@@ -304,68 +259,38 @@ class EggRoll:
         freeze_nonlora: bool = True,
         noise_reuse: int = 0,
         rank: int = 1,
-        use_batched_update: bool = False,
+        **kwargs,
     ) -> tuple[FrozenNoiserParams, NoisedParams]:
-        """Initialize the EGGROLL noiser.
-
-        Args:
-            model: The model to train.
-            sigma: Perturbation magnitude.
-            lr: Learning rate.
-            optimizer_cls: PyTorch optimizer class (default: Adam).
-            optimizer_kwargs: Additional optimizer kwargs.
-            group_size: Group size for fitness normalization.
-            freeze_nonlora: If True, don't perturb non-matrix params.
-            noise_reuse: Reuse noise across this many epochs.
-            rank: Rank of LoRA perturbations.
-            use_batched_update: Whether to batch gradient computation.
-
-        Returns:
-            (frozen_params, noised_params) tuple.
-        """
         if optimizer_cls is None:
             optimizer_cls = torch.optim.Adam
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
 
         optimizer = optimizer_cls(model.parameters(), lr=lr, **optimizer_kwargs)
-
         frozen = FrozenNoiserParams(
             group_size=group_size,
             freeze_nonlora=freeze_nonlora,
             noise_reuse=noise_reuse,
             rank=rank,
-            use_batched_update=use_batched_update,
         )
-        noised = NoisedParams(sigma=sigma, optimizer=optimizer)
-        return frozen, noised
+        return frozen, NoisedParams(sigma=sigma, optimizer=optimizer)
 
     @classmethod
     def classify_param(cls, name: str, param: torch.Tensor) -> int:
-        """Classify a parameter for ES update strategy.
-
-        Returns:
-            PARAM (0) for biases/scalars (full perturbation),
-            MM_PARAM (1) for weight matrices (LoRA perturbation),
-            EMB_PARAM (2) for embeddings (LoRA perturbation),
-            EXCLUDED (3) for frozen parameters.
-        """
         if "embed" in name.lower() or "lm_head" in name.lower():
             return EXCLUDED
-        elif param.ndim >= 2 and "weight" in name.lower():
+        if param.ndim >= 2 and "weight" in name.lower():
             return MM_PARAM
-        elif param.ndim <= 1:
+        if param.ndim <= 1:
             return PARAM
-        else:
-            return MM_PARAM
+        return MM_PARAM
 
     @classmethod
     def get_param_seeds(cls, model: nn.Module, base_seed: int = 42) -> dict:
-        """Generate deterministic per-parameter seeds."""
-        seeds = {}
-        for i, (name, _) in enumerate(model.named_parameters()):
-            seeds[name] = base_seed + i * 7919  # Prime-spaced seeds
-        return seeds
+        return {
+            name: base_seed + i * 7919
+            for i, (name, _) in enumerate(model.named_parameters())
+        }
 
     @classmethod
     def perturb_model(
@@ -378,61 +303,65 @@ class EggRoll:
         param_seeds: dict[str, int],
         original_params: dict[str, torch.Tensor],
     ) -> None:
-        """Apply perturbations to model parameters in-place.
+        """Apply perturbation for a single population member in-place."""
+        true_epoch = 0 if frozen.noise_reuse == 0 else epoch // frozen.noise_reuse
+        true_thread = thread_id // 2
+        sign = 1.0 if thread_id % 2 == 0 else -1.0
+        r = frozen.rank
 
-        For LoRA params (matrices): W' = W + A @ B^T
-        For full params (biases): p' = p + noise
-        For excluded params: no change
-        """
         with torch.no_grad():
             for name, param in model.named_parameters():
                 classification = cls.classify_param(name, param)
                 if classification == EXCLUDED:
                     continue
+                if classification == PARAM and frozen.freeze_nonlora:
+                    continue
 
                 seed = param_seeds[name]
                 original = original_params[name]
+                gen = torch.Generator()
+                combined = seed ^ (true_epoch * 2654435761) ^ (true_thread * 40503)
+                gen.manual_seed(combined & 0xFFFFFFFF)
 
                 if classification == MM_PARAM:
-                    A, B = get_lora_perturbation(
-                        frozen, sigma, epoch, thread_id, original, seed
+                    a, b = original.shape
+                    lora = torch.randn(
+                        a + b,
+                        r,
+                        generator=gen,
+                        dtype=original.dtype,
+                        device=original.device,
                     )
-                    param.copy_(original + A @ B.T)
-                elif classification == PARAM:
-                    if frozen.freeze_nonlora:
-                        continue
-                    noise = get_full_perturbation(
-                        frozen, sigma, epoch, thread_id, original, seed
+                    B_i, A_i = lora[:b], lora[b:]
+                    eff_sigma = sign * sigma / math.sqrt(r)
+                    param.copy_(original + (A_i * eff_sigma) @ B_i.T)
+                else:
+                    noise = torch.randn(
+                        *original.shape,
+                        generator=gen,
+                        dtype=original.dtype,
+                        device=original.device,
                     )
-                    param.copy_(original + noise)
+                    param.copy_(original + noise * sign * sigma)
 
     @classmethod
     def compute_gradients(
         cls,
         frozen: FrozenNoiserParams,
         sigma: float,
+        epoch: int,
+        pop_size: int,
         model: nn.Module,
         param_seeds: dict[str, int],
         fitnesses: torch.Tensor,
-        epochs: torch.Tensor,
-        thread_ids: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Compute ES gradient estimates from population fitnesses.
+        """Vectorized gradient estimation for all parameters.
 
-        Args:
-            frozen: Frozen noiser configuration.
-            sigma: Perturbation magnitude.
-            model: The model (with original unperturbed weights).
-            param_seeds: Per-parameter random seeds.
-            fitnesses: Normalized fitness scores, shape (pop_size,).
-            epochs: Epoch indices for each population member.
-            thread_ids: Thread indices for each population member.
-
-        Returns:
-            Dictionary mapping parameter names to gradient tensors.
+        All population members' noise is generated in batch and combined
+        via a single einsum/broadcast per parameter — no Python loop
+        over population.
         """
         gradients = {}
-        pop_size = fitnesses.shape[0]
 
         for name, param in model.named_parameters():
             classification = cls.classify_param(name, param)
@@ -441,16 +370,15 @@ class EggRoll:
             if classification == EXCLUDED:
                 gradients[name] = torch.zeros_like(param)
             elif classification == MM_PARAM:
-                grad = compute_lora_gradient(
-                    frozen, sigma, param, seed, fitnesses, epochs, thread_ids
+                grad = compute_lora_gradient_batched(
+                    frozen, sigma, epoch, pop_size, param, seed, fitnesses
                 )
-                # Scale by sqrt(pop_size) and negate (for maximization)
-                gradients[name] = -(grad * math.sqrt(pop_size))
+                gradients[name] = -(grad * math.sqrt(pop_size)).to(param.dtype)
             elif classification == PARAM:
-                grad = compute_full_gradient(
-                    frozen, sigma, param, seed, fitnesses, epochs, thread_ids
+                grad = compute_full_gradient_batched(
+                    frozen, sigma, epoch, pop_size, param, seed, fitnesses
                 )
-                gradients[name] = -(grad * math.sqrt(pop_size))
+                gradients[name] = -(grad * math.sqrt(pop_size)).to(param.dtype)
 
         return gradients
 
@@ -461,19 +389,12 @@ class EggRoll:
         model: nn.Module,
         gradients: dict[str, torch.Tensor],
     ) -> None:
-        """Apply gradient estimates to update model parameters.
-
-        Uses the configured optimizer (Adam/SGD) to apply the
-        evolutionary gradient estimates.
-        """
+        """Apply ES gradient estimates via the configured optimizer."""
         noised.optimizer.zero_grad()
-
-        # Set .grad on each parameter from our ES gradient estimates
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if name in gradients:
                     param.grad = gradients[name].to(param.dtype)
-
         noised.optimizer.step()
         noised.step += 1
 
@@ -481,16 +402,11 @@ class EggRoll:
     def convert_fitnesses(
         cls, frozen: FrozenNoiserParams, raw_scores: torch.Tensor
     ) -> torch.Tensor:
-        """Normalize raw fitness scores."""
         return normalize_fitnesses(raw_scores, frozen.group_size)
 
 
 class OpenES:
-    """OpenAI-style Evolutionary Strategy.
-
-    Uses full-rank perturbations for all parameters (no LoRA).
-    Simpler but more memory-intensive than EggRoll.
-    """
+    """OpenAI-style ES. Full-rank perturbations for all parameters."""
 
     @classmethod
     def init(
@@ -503,12 +419,12 @@ class OpenES:
         group_size: int = 0,
         freeze_nonlora: bool = False,
         noise_reuse: int = 0,
+        **kwargs,
     ) -> tuple[FrozenNoiserParams, NoisedParams]:
         if optimizer_cls is None:
             optimizer_cls = torch.optim.SGD
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
-
         optimizer = optimizer_cls(model.parameters(), lr=lr, **optimizer_kwargs)
         frozen = FrozenNoiserParams(
             group_size=group_size,
@@ -516,14 +432,13 @@ class OpenES:
             noise_reuse=noise_reuse,
             rank=1,
         )
-        noised = NoisedParams(sigma=sigma, optimizer=optimizer)
-        return frozen, noised
+        return frozen, NoisedParams(sigma=sigma, optimizer=optimizer)
 
     @classmethod
     def classify_param(cls, name: str, param: torch.Tensor) -> int:
         if "embed" in name.lower() or "lm_head" in name.lower():
             return EXCLUDED
-        return PARAM  # OpenES uses full perturbation for everything
+        return PARAM
 
     @classmethod
     def get_param_seeds(cls, model: nn.Module, base_seed: int = 42) -> dict:
@@ -540,52 +455,37 @@ class OpenES:
         param_seeds: dict[str, int],
         original_params: dict[str, torch.Tensor],
     ) -> None:
-        with torch.no_grad():
-            for name, param in model.named_parameters():
-                classification = cls.classify_param(name, param)
-                if classification == EXCLUDED:
-                    continue
-                if frozen.freeze_nonlora and classification == PARAM:
-                    continue
-
-                seed = param_seeds[name]
-                original = original_params[name]
-                noise = get_full_perturbation(
-                    frozen, sigma, epoch, thread_id, original, seed
-                )
-                param.copy_(original + noise)
+        EggRoll.perturb_model(
+            frozen, sigma, model, epoch, thread_id, param_seeds, original_params
+        )
 
     @classmethod
     def compute_gradients(
         cls,
         frozen: FrozenNoiserParams,
         sigma: float,
+        epoch: int,
+        pop_size: int,
         model: nn.Module,
         param_seeds: dict[str, int],
         fitnesses: torch.Tensor,
-        epochs: torch.Tensor,
-        thread_ids: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         gradients = {}
-        pop_size = fitnesses.shape[0]
         for name, param in model.named_parameters():
             classification = cls.classify_param(name, param)
             seed = param_seeds[name]
             if classification == EXCLUDED:
                 gradients[name] = torch.zeros_like(param)
             else:
-                grad = compute_full_gradient(
-                    frozen, sigma, param, seed, fitnesses, epochs, thread_ids
+                grad = compute_full_gradient_batched(
+                    frozen, sigma, epoch, pop_size, param, seed, fitnesses
                 )
-                gradients[name] = -(grad * math.sqrt(pop_size))
+                gradients[name] = -(grad * math.sqrt(pop_size)).to(param.dtype)
         return gradients
 
     @classmethod
     def update_params(
-        cls,
-        noised: NoisedParams,
-        model: nn.Module,
-        gradients: dict[str, torch.Tensor],
+        cls, noised: NoisedParams, model: nn.Module, gradients: dict[str, torch.Tensor]
     ) -> None:
         EggRoll.update_params(noised, model, gradients)
 

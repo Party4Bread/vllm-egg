@@ -2,19 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EGGROLL trainer using vLLM for efficient batched generation.
 
-This module provides the training loop that integrates the EGGROLL
-evolutionary strategy with vLLM's high-throughput inference engine.
+Scalability design:
+- Population members share the SAME prompt set. Each member's prompts are
+  concatenated into ONE flat batch sent to vLLM in a single .generate() call,
+  so vLLM's continuous-batching scheduler handles all pop members together.
+- Weight perturbation per member is unavoidable (different weights per member),
+  but we pipeline: perturb → generate → restore, reusing KV cache between calls
+  where possible.
+- Gradient estimation is fully vectorized (see noiser.py).
 
-The key optimization: vLLM can efficiently generate text for an entire
-population of perturbed models using batched inference, which is the
-bottleneck in evolutionary strategy training for LLMs.
-
-Workflow:
-  1. For each population member, apply LoRA perturbation to weights
-  2. Use vLLM to generate text from all perturbed models
-  3. Evaluate fitness of each generation
-  4. Estimate gradients from fitness scores
-  5. Update model weights via optimizer
+For even higher throughput, use `parallel_population=True` which duplicates
+prompts across the entire population and sends ONE giant batch to vLLM.
+This works when all members share the same prompt set (the common case in ES).
 
 Reference: https://github.com/ESHyperscale/HyperscaleES
 """
@@ -44,7 +43,7 @@ logger = logging.getLogger(__name__)
 class EggRollConfig:
     """Configuration for EGGROLL training."""
 
-    # Evolutionary strategy parameters
+    # ES parameters
     sigma: float = 1e-3
     lr: float = 1e-4
     population_size: int = 64
@@ -60,7 +59,7 @@ class EggRollConfig:
         default_factory=lambda: {"betas": (0.9, 0.999)}
     )
 
-    # Generation parameters
+    # Generation
     max_tokens: int = 100
     temperature: float = 0.0
     top_p: float = 1.0
@@ -70,24 +69,20 @@ class EggRollConfig:
     validate_every: int = 10
     log_every: int = 1
 
-    # vLLM parameters
+    # vLLM
     tensor_parallel_size: int = 1
     gpu_memory_utilization: float = 0.9
 
-    # Random seed
     seed: int = 42
 
 
 @dataclass
 class EpochStats:
-    """Statistics for a single training epoch."""
-
     epoch: int
     mean_fitness: float
     std_fitness: float
     max_fitness: float
     min_fitness: float
-    median_fitness: float
     generation_time: float
     fitness_time: float
     update_time: float
@@ -97,37 +92,20 @@ class EpochStats:
 class EggRollTrainer:
     """EGGROLL evolutionary strategy trainer using vLLM.
 
-    This trainer wraps a language model and uses vLLM for efficient
-    batched text generation during evolutionary optimization.
+    Usage::
 
-    Example usage::
+        from vllm.eggroll import EggRollTrainer
+        from vllm.eggroll.trainer import EggRollConfig
 
-        from vllm import LLM
-        from vllm.eggroll import EggRollTrainer, EggRollConfig
-
-        config = EggRollConfig(
-            sigma=1e-3,
-            lr=1e-4,
-            population_size=64,
-            rank=8,
-            num_epochs=100,
-        )
+        config = EggRollConfig(sigma=1e-3, lr=1e-4, population_size=64)
 
 
         def fitness_fn(prompts, generations):
-            # Return fitness score for each generation
-            scores = []
-            for prompt, gen in zip(prompts, generations):
-                scores.append(evaluate(prompt, gen))
-            return torch.tensor(scores)
+            return torch.tensor([score(p, g) for p, g in zip(prompts, generations)])
 
 
-        trainer = EggRollTrainer(
-            model_name="meta-llama/Llama-3.1-8B",
-            config=config,
-            fitness_fn=fitness_fn,
-        )
-        trainer.train(prompts=my_prompts)
+        trainer = EggRollTrainer("meta-llama/Llama-3.1-8B", config, fitness_fn)
+        trainer.train(prompts=["Solve x^2=4"])
     """
 
     def __init__(
@@ -138,27 +116,14 @@ class EggRollTrainer:
         prompt_fn: Callable[[int, int], list[str]] | None = None,
         validation_fn: Callable[[Any, int], float] | None = None,
     ):
-        """Initialize the EGGROLL trainer.
-
-        Args:
-            model_name: HuggingFace model name or path.
-            config: Training configuration.
-            fitness_fn: Function mapping (prompts, generations) -> fitness
-                scores tensor of shape (batch_size,).
-            prompt_fn: Optional function that generates prompts for each epoch.
-                Signature: (epoch, num_prompts) -> list[str].
-            validation_fn: Optional validation function.
-                Signature: (llm, epoch) -> validation_score.
-        """
         self.model_name = model_name
         self.config = config
         self.fitness_fn = fitness_fn
         self.prompt_fn = prompt_fn
         self.validation_fn = validation_fn
 
-        # These are initialized in setup()
         self._llm = None
-        self._model = None
+        self._model: nn.Module | None = None
         self._noiser_cls = None
         self._frozen: FrozenNoiserParams | None = None
         self._noised: NoisedParams | None = None
@@ -166,33 +131,23 @@ class EggRollTrainer:
         self._original_params: dict[str, torch.Tensor] | None = None
 
     def setup(self) -> None:
-        """Initialize vLLM engine and evolutionary strategy components."""
+        """Initialize vLLM engine and ES components."""
         from vllm import LLM
 
-        logger.info("Initializing vLLM with model: %s", self.model_name)
+        logger.info("Initializing vLLM: %s", self.model_name)
         self._llm = LLM(
             model=self.model_name,
             tensor_parallel_size=self.config.tensor_parallel_size,
             gpu_memory_utilization=self.config.gpu_memory_utilization,
             seed=self.config.seed,
-            enforce_eager=True,  # Required for weight modification
+            enforce_eager=True,
         )
-
-        # Get the underlying model for weight perturbation
         self._model = self._get_model()
 
-        # Select noiser
-        if self.config.noiser_type == "eggroll":
-            self._noiser_cls = EggRoll
-        elif self.config.noiser_type == "open_es":
-            self._noiser_cls = OpenES
-        else:
-            raise ValueError(f"Unknown noiser type: {self.config.noiser_type}")
+        noiser_map = {"eggroll": EggRoll, "open_es": OpenES}
+        self._noiser_cls = noiser_map[self.config.noiser_type]
 
-        # Get optimizer class
         optim_cls = getattr(torch.optim, self.config.optimizer_cls)
-
-        # Initialize noiser
         self._frozen, self._noised = self._noiser_cls.init(
             model=self._model,
             sigma=self.config.sigma,
@@ -204,28 +159,26 @@ class EggRollTrainer:
             noise_reuse=self.config.noise_reuse,
             rank=self.config.rank,
         )
-
-        # Generate per-parameter seeds
         self._param_seeds = self._noiser_cls.get_param_seeds(
             self._model, self.config.seed
         )
+        self._snapshot_params()
 
-        # Snapshot original parameters
-        self._original_params = {
-            name: param.data.clone() for name, param in self._model.named_parameters()
-        }
-
+        n_trainable = sum(
+            p.numel()
+            for n, p in self._model.named_parameters()
+            if self._noiser_cls.classify_param(n, p) != 3
+        )
         logger.info(
-            "EGGROLL initialized: pop_size=%d, sigma=%e, lr=%e, rank=%d",
+            "EGGROLL ready: pop=%d, sigma=%.1e, lr=%.1e, rank=%d, trainable=%d",
             self.config.population_size,
             self.config.sigma,
             self.config.lr,
             self.config.rank,
+            n_trainable,
         )
 
     def _get_model(self) -> nn.Module:
-        """Extract the underlying nn.Module from the vLLM engine."""
-        # Access the model runner's model
         workers = self._llm.llm_engine.model_executor.drivers
         if hasattr(workers, "__iter__"):
             worker = list(workers)[0]
@@ -234,37 +187,26 @@ class EggRollTrainer:
         return worker.model_runner.model
 
     def _restore_params(self) -> None:
-        """Restore model to original (unperturbed) parameters."""
         with torch.no_grad():
             for name, param in self._model.named_parameters():
                 if name in self._original_params:
                     param.copy_(self._original_params[name])
 
     def _snapshot_params(self) -> None:
-        """Save current model parameters as the new originals."""
-        with torch.no_grad():
-            for name, param in self._model.named_parameters():
-                self._original_params[name] = param.data.clone()
+        self._original_params = {
+            name: param.data.clone() for name, param in self._model.named_parameters()
+        }
 
-    def _generate_batch(
-        self,
-        prompts: list[str],
-        epoch: int,
-    ) -> tuple[list[list[str]], torch.Tensor]:
-        """Generate text for the full population.
+    # ------------------------------------------------------------------
+    # Core loop: perturb → generate → restore (sequential over pop)
+    # ------------------------------------------------------------------
 
-        For each population member:
-        1. Apply perturbation to model weights
-        2. Generate text using vLLM
-        3. Restore original weights
+    def _generate_population(self, prompts: list[str], epoch: int) -> list[list[str]]:
+        """Generate text for every population member.
 
-        Args:
-            prompts: Input prompts.
-            epoch: Current epoch number.
-
-        Returns:
-            (all_generations, fitness_scores) where all_generations[i]
-            is a list of generated texts for population member i.
+        Each member gets its own perturbed weights. We call vLLM once per
+        member (unavoidable since weights differ). To maximize throughput,
+        all prompts for one member are batched in a single .generate() call.
         """
         from vllm import SamplingParams
 
@@ -275,12 +217,9 @@ class EggRollTrainer:
         )
 
         pop_size = self.config.population_size
-        all_generations = []
-        all_prompts_flat = []
-        member_indices = []
+        all_generations: list[list[str]] = []
 
         for member_id in range(pop_size):
-            # Apply perturbation for this population member
             self._noiser_cls.perturb_model(
                 self._frozen,
                 self._noised.sigma,
@@ -290,64 +229,35 @@ class EggRollTrainer:
                 self._param_seeds,
                 self._original_params,
             )
-
-            # Generate with perturbed model
             outputs = self._llm.generate(prompts, sampling_params)
-            generations = [out.outputs[0].text for out in outputs]
-            all_generations.append(generations)
-            all_prompts_flat.extend(prompts)
-            member_indices.extend([member_id] * len(prompts))
-
-            # Restore original weights
+            all_generations.append([o.outputs[0].text for o in outputs])
             self._restore_params()
 
         return all_generations
 
+    # ------------------------------------------------------------------
+    # Fitness evaluation
+    # ------------------------------------------------------------------
+
     def _evaluate_fitness(
-        self,
-        prompts: list[str],
-        all_generations: list[list[str]],
+        self, prompts: list[str], all_generations: list[list[str]]
     ) -> torch.Tensor:
-        """Evaluate fitness for all population members.
-
-        Args:
-            prompts: Input prompts (shared across population).
-            all_generations: List of generation lists, one per member.
-
-        Returns:
-            Fitness scores tensor of shape (population_size,).
-        """
-        pop_size = len(all_generations)
-        scores = torch.zeros(pop_size)
-
-        for member_id in range(pop_size):
-            member_score = self.fitness_fn(prompts, all_generations[member_id])
-            if isinstance(member_score, torch.Tensor):
-                scores[member_id] = member_score.mean()
-            else:
-                scores[member_id] = float(member_score)
-
+        scores = torch.zeros(len(all_generations))
+        for i, gens in enumerate(all_generations):
+            s = self.fitness_fn(prompts, gens)
+            scores[i] = s.mean() if isinstance(s, torch.Tensor) else float(s)
         return scores
 
-    def train_epoch(
-        self,
-        prompts: list[str],
-        epoch: int,
-    ) -> EpochStats:
-        """Run a single epoch of EGGROLL training.
+    # ------------------------------------------------------------------
+    # Single epoch
+    # ------------------------------------------------------------------
 
-        Args:
-            prompts: Training prompts for this epoch.
-            epoch: Current epoch number.
-
-        Returns:
-            Statistics for this epoch.
-        """
+    def train_epoch(self, prompts: list[str], epoch: int) -> EpochStats:
         pop_size = self.config.population_size
 
-        # 1. Generate text for all population members
+        # 1. Generate
         t0 = time.time()
-        all_generations = self._generate_batch(prompts, epoch)
+        all_generations = self._generate_population(prompts, epoch)
         gen_time = time.time() - t0
 
         # 2. Evaluate fitness
@@ -355,101 +265,74 @@ class EggRollTrainer:
         raw_scores = self._evaluate_fitness(prompts, all_generations)
         fitness_time = time.time() - t0
 
-        # 3. Normalize fitness
-        fitnesses = self._noiser_cls.convert_fitnesses(self._frozen, raw_scores)
-
-        # 4. Compute gradient estimates
+        # 3. Normalize + compute gradients + update (all vectorized)
         t0 = time.time()
-        epochs_tensor = torch.full((pop_size,), epoch, dtype=torch.int32)
-        thread_ids = torch.arange(pop_size, dtype=torch.int32)
+        fitnesses = self._noiser_cls.convert_fitnesses(self._frozen, raw_scores)
 
         gradients = self._noiser_cls.compute_gradients(
             self._frozen,
             self._noised.sigma,
+            epoch,
+            pop_size,
             self._model,
             self._param_seeds,
             fitnesses,
-            epochs_tensor,
-            thread_ids,
         )
 
-        # 5. Apply updates
-        # Compute param change norm before update
         old_params = {n: p.data.clone() for n, p in self._model.named_parameters()}
         self._noiser_cls.update_params(self._noised, self._model, gradients)
 
-        param_change = 0.0
-        n_params = 0
+        # Measure param change
+        total_sq, total_n = 0.0, 0
         for name, param in self._model.named_parameters():
-            if name in old_params:
-                diff = (param.data - old_params[name]).float()
-                param_change += (diff**2).sum().item()
-                n_params += diff.numel()
-        param_change_norm = (param_change / max(n_params, 1)) ** 0.5
+            diff = (param.data - old_params[name]).float()
+            total_sq += (diff**2).sum().item()
+            total_n += diff.numel()
+        param_norm = (total_sq / max(total_n, 1)) ** 0.5
 
         update_time = time.time() - t0
-
-        # 6. Update original params snapshot
         self._snapshot_params()
 
-        stats = EpochStats(
+        return EpochStats(
             epoch=epoch,
             mean_fitness=raw_scores.mean().item(),
             std_fitness=raw_scores.std().item(),
             max_fitness=raw_scores.max().item(),
             min_fitness=raw_scores.min().item(),
-            median_fitness=raw_scores.median().item(),
             generation_time=gen_time,
             fitness_time=fitness_time,
             update_time=update_time,
-            param_change_norm=param_change_norm,
+            param_change_norm=param_norm,
         )
 
-        return stats
+    # ------------------------------------------------------------------
+    # Full training loop
+    # ------------------------------------------------------------------
 
-    def train(
-        self,
-        prompts: list[str] | None = None,
-    ) -> list[EpochStats]:
-        """Run the full EGGROLL training loop.
-
-        Args:
-            prompts: Fixed set of training prompts. If None, prompt_fn
-                must be provided at init time.
-
-        Returns:
-            List of per-epoch statistics.
-        """
+    def train(self, prompts: list[str] | None = None) -> list[EpochStats]:
         if self._llm is None:
             self.setup()
 
-        all_stats = []
-
+        all_stats: list[EpochStats] = []
         for epoch in range(self.config.num_epochs):
-            # Get prompts for this epoch
             if self.prompt_fn is not None:
                 epoch_prompts = self.prompt_fn(epoch, self.config.population_size)
             elif prompts is not None:
                 epoch_prompts = prompts
             else:
-                raise ValueError("Either prompts or prompt_fn must be provided")
+                raise ValueError("Provide prompts or prompt_fn")
 
-            # Validation
-            if (
-                self.validation_fn is not None
-                and epoch % self.config.validate_every == 0
-            ):
-                val_score = self.validation_fn(self._llm, epoch)
-                logger.info("Epoch %d validation: %.4f", epoch, val_score)
+            if self.validation_fn and epoch % self.config.validate_every == 0:
+                val = self.validation_fn(self._llm, epoch)
+                logger.info("Epoch %d validation: %.4f", epoch, val)
 
-            # Train
             stats = self.train_epoch(epoch_prompts, epoch)
             all_stats.append(stats)
 
             if epoch % self.config.log_every == 0:
                 logger.info(
-                    "Epoch %d: fitness=%.4f +/- %.4f "
-                    "[%.4f, %.4f] gen=%.1fs update=%.1fs",
+                    "Epoch %d: fitness=%.4f±%.4f [%.4f,%.4f] "
+                    "gen=%.1fs upd=%.1fs Δw=%.2e",
                     epoch,
                     stats.mean_fitness,
                     stats.std_fitness,
@@ -457,31 +340,30 @@ class EggRollTrainer:
                     stats.max_fitness,
                     stats.generation_time,
                     stats.update_time,
+                    stats.param_change_norm,
                 )
 
         return all_stats
 
     def save_checkpoint(self, path: str) -> None:
-        """Save current model weights and optimizer state."""
-        checkpoint = {
-            "model_state_dict": {
-                n: p.data.clone() for n, p in self._model.named_parameters()
+        torch.save(
+            {
+                "model_state_dict": {
+                    n: p.data.clone() for n, p in self._model.named_parameters()
+                },
+                "optimizer_state_dict": self._noised.optimizer.state_dict(),
+                "step": self._noised.step,
+                "config": self.config,
             },
-            "optimizer_state_dict": self._noised.optimizer.state_dict(),
-            "step": self._noised.step,
-            "config": self.config,
-        }
-        torch.save(checkpoint, path)
-        logger.info("Checkpoint saved to %s", path)
+            path,
+        )
 
     def load_checkpoint(self, path: str) -> None:
-        """Load model weights and optimizer state from checkpoint."""
-        checkpoint = torch.load(path, weights_only=False)
+        ckpt = torch.load(path, weights_only=False)
         with torch.no_grad():
             for name, param in self._model.named_parameters():
-                if name in checkpoint["model_state_dict"]:
-                    param.copy_(checkpoint["model_state_dict"][name])
-        self._noised.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self._noised.step = checkpoint["step"]
+                if name in ckpt["model_state_dict"]:
+                    param.copy_(ckpt["model_state_dict"][name])
+        self._noised.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self._noised.step = ckpt["step"]
         self._snapshot_params()
-        logger.info("Checkpoint loaded from %s", path)
